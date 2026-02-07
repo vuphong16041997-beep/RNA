@@ -65,11 +65,21 @@ class RNASample:
 
 
 # ---------------------------------------------------------------------------
-# bpRNA parser (.sta format)
+# bpRNA .st (structure type) parser
 # ---------------------------------------------------------------------------
 
-def parse_bprna_sta(filepath: str) -> Optional[RNASample]:
-    """Parse a single bpRNA .sta (structure annotation) file."""
+def parse_bprna_st(filepath: str) -> Optional[RNASample]:
+    """Parse a bpRNA .st (structure type) file.
+
+    The bpRNA .st format contains:
+    - Header lines (Filename, Organism, Accession, etc.)
+    - Sequence line
+    - Dot-bracket structure line
+    - Structure type annotation line (E=External, S=Stem, H=Hairpin, etc.)
+    - Detailed structural feature entries (S1, H1, B1, I1, M1, etc.)
+
+    This is the primary format from https://bprna.cgrb.oregonstate.edu/
+    """
     name = Path(filepath).stem
     sequence = ""
     structure = ""
@@ -78,12 +88,72 @@ def parse_bprna_sta(filepath: str) -> Optional[RNASample]:
         with open(filepath, "r") as f:
             lines = f.readlines()
 
-        # .sta files have lines like:
-        # Filename: ...
-        # Organism: ...
-        # Accession: ...
-        # Sequence: ACGU...
-        # Structure: ((..))
+        # The .st file has a specific layout:
+        # Line with "Filename:", "Organism:", "Accession:" etc. as headers
+        # Then the actual data lines contain sequence, structure, annotation
+        # We look for the sequence and dot-bracket lines
+        header_done = False
+        data_lines = []
+
+        for line in lines:
+            stripped = line.rstrip("\n\r")
+
+            # Skip empty lines and comment/header lines
+            if not stripped:
+                continue
+
+            # Header lines contain ':'
+            if ":" in stripped and not header_done:
+                key = stripped.split(":")[0].strip()
+                if key in ("Filename", "Organism", "Accession", "Citation",
+                           "Type", "Length", "PageNum"):
+                    continue
+
+            # Feature description lines (S1, H1, B1, I1, M1, PK1, E1...)
+            if re.match(r'^(S|H|B|I|M|PK|E|segment)\d', stripped):
+                continue
+
+            # Remaining lines are data: sequence, structure, annotation
+            data_lines.append(stripped)
+
+        # Typically: data_lines[0] = sequence, data_lines[1] = dot-bracket,
+        # data_lines[2] = structure type annotation (ESHIBM characters)
+        if len(data_lines) >= 2:
+            # The sequence line contains only ACGU characters
+            for i, line in enumerate(data_lines):
+                clean = line.strip()
+                if clean and all(c in "ACGUNacgun" for c in clean):
+                    sequence = clean.upper()
+                    # Next line should be dot-bracket
+                    if i + 1 < len(data_lines):
+                        candidate = data_lines[i + 1].strip()
+                        if all(c in "()[]{}.<>" for c in candidate):
+                            structure = candidate
+                    break
+
+        if sequence and structure and len(sequence) == len(structure):
+            return RNASample(name=name, sequence=sequence, structure=structure)
+    except Exception:
+        pass
+
+    return None
+
+
+def parse_bprna_sta(filepath: str) -> Optional[RNASample]:
+    """Parse a bpRNA .sta file (alternative structure annotation format).
+
+    Some bpRNA distributions use a simpler key:value format:
+        Sequence: ACGU...
+        Structure: ((..))
+    """
+    name = Path(filepath).stem
+    sequence = ""
+    structure = ""
+
+    try:
+        with open(filepath, "r") as f:
+            lines = f.readlines()
+
         for line in lines:
             line = line.strip()
             if line.startswith("Sequence:"):
@@ -322,13 +392,22 @@ def generate_synthetic_dataset(n_samples: int = 5000,
 def load_dataset_from_dir(data_dir: str,
                           max_samples: int = 0,
                           max_length: int = 600) -> List[RNASample]:
-    """Load RNA samples from a directory containing .bpseq, .ct, .dbn, or .sta files."""
+    """Load RNA samples from a directory containing .bpseq, .ct, .dbn, .st, or .sta files.
+
+    Recursively scans all subdirectories. This handles the bpRNA download
+    structure where files are organized in subdirectories.
+    """
     samples = []
     data_path = Path(data_dir)
+    failed = 0
 
-    for filepath in sorted(data_path.rglob("*")):
+    file_list = sorted(data_path.rglob("*"))
+    for filepath in tqdm(file_list, desc="Loading files", disable=len(file_list) < 100):
         if max_samples > 0 and len(samples) >= max_samples:
             break
+
+        if filepath.is_dir():
+            continue
 
         ext = filepath.suffix.lower()
         sample = None
@@ -337,6 +416,8 @@ def load_dataset_from_dir(data_dir: str,
             sample = parse_bpseq(str(filepath))
         elif ext == ".ct":
             sample = parse_ct_file(str(filepath))
+        elif ext == ".st":
+            sample = parse_bprna_st(str(filepath))
         elif ext == ".sta":
             sample = parse_bprna_sta(str(filepath))
         elif ext == ".dbn":
@@ -344,9 +425,16 @@ def load_dataset_from_dir(data_dir: str,
                 if s.length <= max_length:
                     samples.append(s)
             continue
+        else:
+            continue
 
         if sample and sample.length <= max_length:
             samples.append(sample)
+        elif ext in (".bpseq", ".ct", ".st", ".sta"):
+            failed += 1
+
+    if failed > 0:
+        print(f"Warning: {failed} files failed to parse or exceeded max_length={max_length}")
 
     return samples
 
