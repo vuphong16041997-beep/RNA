@@ -11,5 +11,6 @@ models/
 data/
 !data/.gitkeep
 *.png
+results/
 .venv/
 venv/
